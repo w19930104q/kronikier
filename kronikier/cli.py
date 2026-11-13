@@ -15,7 +15,7 @@ from kronikier.calibration import (
     ensure_calibration,
 )
 from kronikier.cdx import DEFAULT_USER_AGENT
-from kronikier.pipeline import scan_domain
+from kronikier.pipeline import ScanResult, scan_domain
 from kronikier.report import (
     _aggregate_rows,
     _default_csv_path,
@@ -116,10 +116,10 @@ def parse_targets_file(path: Path) -> list[Target]:
 #: the user can use either form interchangeably. Mutually exclusive with
 #: ``--timeout``.
 MODE_ALIASES: dict[str, tuple[float, bool]] = {
-    "auto":       (300.0, False),
-    "default":    (300.0, False),
-    "deep":       (900.0, False),
-    "exhaustive": (0.0,   True),
+    "auto": (300.0, False),
+    "default": (300.0, False),
+    "deep": (900.0, False),
+    "exhaustive": (0.0, True),
 }
 
 
@@ -149,7 +149,30 @@ def build_parser() -> argparse.ArgumentParser:
         "('example.com') or a URL ('https://example.com/team'); URL paths "
         "are added to the well-known probe list for that domain's scan. "
         "Multiple URLs sharing a domain are merged. Mutually exclusive "
-        "with the positional `domain` argument.",
+        "with the positional `domain` argument. Batch progress is tracked "
+        "in a resumable manifest (see --state-file / --restart): a failed "
+        "target never stops the remaining ones, and rerunning skips "
+        "targets already finished.",
+    )
+    p.add_argument(
+        "--state-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Location of the resumable batch manifest used with "
+        "--targets-file. Default: <targets-file>.manifest.json next to "
+        "the targets file. The manifest records each target's state "
+        "(waiting/running/completed/no_snapshots/failed with an error "
+        "category) and is flushed atomically after every target, so "
+        "Ctrl+C or a crash can be resumed by simply rerunning the same "
+        "command.",
+    )
+    p.add_argument(
+        "--restart",
+        action="store_true",
+        help="Ignore any existing batch manifest and rescan every target "
+        "in --targets-file from scratch (the old manifest is overwritten). "
+        "Only valid together with --targets-file.",
     )
     p.add_argument(
         "--single-url",
@@ -177,22 +200,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     timeout_group.add_argument(
         "--auto",
-        action="store_const", dest="mode_alias", const="auto",
+        action="store_const",
+        dest="mode_alias",
+        const="auto",
         help="Alias for --timeout 300 (the default).",
     )
     timeout_group.add_argument(
         "--default",
-        action="store_const", dest="mode_alias", const="default",
+        action="store_const",
+        dest="mode_alias",
+        const="default",
         help="Alias for --timeout 300 — fast, contact-URL filter on.",
     )
     timeout_group.add_argument(
         "--deep",
-        action="store_const", dest="mode_alias", const="deep",
+        action="store_const",
+        dest="mode_alias",
+        const="deep",
         help="Alias for --timeout 900 — broader scan, contact-URL filter on.",
     )
     timeout_group.add_argument(
         "--exhaustive",
-        action="store_const", dest="mode_alias", const="exhaustive",
+        action="store_const",
+        dest="mode_alias",
+        const="exhaustive",
         help="Alias for --timeout 0 --all — unlimited time, every URL.",
     )
 
@@ -224,54 +255,105 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # ----- Scope -----
-    p.add_argument("--max-snapshots", type=int, default=None,
-                   help="Optional hard ceiling on snapshots to fetch — layered "
-                   "on top of the timeout-derived capacity. Default: timeout decides.")
-    p.add_argument("--from-year", type=int, default=None, help="Limit CDX query to >= this year")
-    p.add_argument("--to-year", type=int, default=None, help="Limit CDX query to <= this year")
-    p.add_argument("--no-subdomains", action="store_true",
-                   help="Restrict to the exact domain (default includes subdomains)")
-    p.add_argument("--no-probe", action="store_true",
-                   help="Skip the typical-contact-pages availability probe.")
-    p.add_argument("--min-score", type=int, default=0, help="Drop URLs scoring below this")
+    p.add_argument(
+        "--max-snapshots",
+        type=int,
+        default=None,
+        help="Optional hard ceiling on snapshots to fetch — layered "
+        "on top of the timeout-derived capacity. Default: timeout decides.",
+    )
+    p.add_argument(
+        "--from-year", type=int, default=None, help="Limit CDX query to >= this year"
+    )
+    p.add_argument(
+        "--to-year", type=int, default=None, help="Limit CDX query to <= this year"
+    )
+    p.add_argument(
+        "--no-subdomains",
+        action="store_true",
+        help="Restrict to the exact domain (default includes subdomains)",
+    )
+    p.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="Skip the typical-contact-pages availability probe.",
+    )
+    p.add_argument(
+        "--min-score", type=int, default=0, help="Drop URLs scoring below this"
+    )
 
     # ----- Performance -----
-    p.add_argument("--workers", type=int, default=4, help="Concurrent fetches (default 4)")
-    p.add_argument("--rate", type=float, default=4.0,
-                   help="Max requests/sec to wayback (default 4)")
-    p.add_argument("--cdx-timeout", type=int, default=300,
-                   help="Per-request CDX read-timeout, in seconds (default 300). "
-                   "Different from --timeout, which is the whole-scan deadline.")
+    p.add_argument(
+        "--workers", type=int, default=4, help="Concurrent fetches (default 4)"
+    )
+    p.add_argument(
+        "--rate",
+        type=float,
+        default=4.0,
+        help="Max requests/sec to wayback (default 4)",
+    )
+    p.add_argument(
+        "--cdx-timeout",
+        type=int,
+        default=300,
+        help="Per-request CDX read-timeout, in seconds (default 300). "
+        "Different from --timeout, which is the whole-scan deadline.",
+    )
 
     # ----- Locale / output -----
-    p.add_argument("--regions", default="RU,BY,UA,KZ,US,GB,DE,FR",
-                   help="Comma-separated phone regions for bare local numbers. "
-                   "The domain's ccTLD is automatically prepended.")
-    p.add_argument("--json", action="store_true",
-                   help="Emit JSON instead of human-readable text")
-    p.add_argument("--csv", dest="csv_path", default=None,
-                   help="Path to write the CSV report (default: "
-                   "<domain>_<timestamp>.csv in CWD)")
+    p.add_argument(
+        "--regions",
+        default="RU,BY,UA,KZ,US,GB,DE,FR",
+        help="Comma-separated phone regions for bare local numbers. "
+        "The domain's ccTLD is automatically prepended.",
+    )
+    p.add_argument(
+        "--json", action="store_true", help="Emit JSON instead of human-readable text"
+    )
+    p.add_argument(
+        "--csv",
+        dest="csv_path",
+        default=None,
+        help="Path to write the CSV report (default: "
+        "<domain>_<timestamp>.csv in CWD)",
+    )
     p.add_argument("--no-csv", action="store_true", help="Do not write a CSV report")
 
     # ----- Cache -----
-    p.add_argument("--no-cache", action="store_true",
-                   help="Disable the on-disk snapshot cache for this run "
-                   "(every fetch goes to web.archive.org). Default: cache is "
-                   "ON at ~/.cache/kronikier/snapshots/.")
-    p.add_argument("--clear-cache", action="store_true",
-                   help="Delete every cached snapshot and exit. Use to free disk "
-                   "space; does not run a scan.")
+    p.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable the on-disk snapshot cache for this run "
+        "(every fetch goes to web.archive.org). Default: cache is "
+        "ON at ~/.cache/kronikier/snapshots/.",
+    )
+    p.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Delete every cached snapshot and exit. Use to free disk "
+        "space; does not run a scan.",
+    )
 
-    p.add_argument("--no-progress", action="store_true",
-                   help="Disable progress bars (auto-disabled if stderr is not a TTY)")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="Verbose contact feed: print the capture date and the "
-                   "full snapshot URL beneath each discovered contact in the "
-                   "live feed. Does NOT enable DEBUG logs — use -d for that.")
-    p.add_argument("-d", "--debug", action="store_true",
-                   help="Enable DEBUG-level logging (probe / fetch / cache "
-                   "internals). Independent of -v.")
+    p.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bars (auto-disabled if stderr is not a TTY)",
+    )
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Verbose contact feed: print the capture date and the "
+        "full snapshot URL beneath each discovered contact in the "
+        "live feed. Does NOT enable DEBUG logs — use -d for that.",
+    )
+    p.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Enable DEBUG-level logging (probe / fetch / cache "
+        "internals). Independent of -v.",
+    )
     return p
 
 
@@ -317,6 +399,275 @@ def main(argv: list[str] | None = None) -> int:
         return 130  # 128 + SIGINT
 
 
+def _scan_kwargs(
+    args,
+    target,
+    *,
+    calibration,
+    regions,
+    sess,
+    cache,
+    timeout_seconds: float,
+    force_all: bool,
+    show_progress: bool,
+) -> dict:
+    """Build the keyword bundle forwarded to :func:`scan_domain` for one target.
+
+    Centralising this guarantees batch and single-target runs invoke the
+    scanner with identical semantics — no flag is ever wired up in only
+    one of the two input modes.
+    """
+    return dict(
+        timeout_seconds=timeout_seconds,
+        force_all=force_all,
+        no_escalate=args.no_escalate,
+        calibration=calibration,
+        max_snapshots=args.max_snapshots,
+        from_year=args.from_year,
+        to_year=args.to_year,
+        include_subdomains=not args.no_subdomains,
+        probe_well_known=not args.no_probe,
+        min_score=args.min_score,
+        session=sess,
+        max_workers=args.workers,
+        rate_limit_per_sec=args.rate,
+        default_phone_regions=regions,
+        extra_well_known_paths=target.extra_paths,
+        single_url=target.single_url,
+        cache=cache,
+        progress=show_progress,
+        verbose=args.verbose,
+        cdx_timeout=args.cdx_timeout,
+    )
+
+
+def _process_target(
+    args,
+    target,
+    *,
+    sess,
+    cache,
+    calibration,
+    regions,
+    timeout_seconds: float,
+    force_all: bool,
+    show_progress: bool,
+    batch_idx=None,
+    batch_total=None,
+) -> ScanResult:
+    """Run one target end-to-end and render its per-target outputs.
+
+    Each invocation gets a fresh :class:`~kronikier.pipeline.ScanResult`
+    and a fresh row list — contacts never accumulate across targets, so
+    a target's CSV/JSON can only ever contain its own sightings. Returns
+    the result so the caller (single mode or the batch loop) can inspect
+    ``interrupted`` and record manifest state.
+    """
+    if batch_total is not None:
+        print(
+            f"\n=== [{batch_idx}/{batch_total}] {target.domain} "
+            + (
+                f"(+{len(target.extra_paths)} extra probe path"
+                f"{'s' if len(target.extra_paths) != 1 else ''})"
+                if target.extra_paths
+                else ""
+            )
+            + " ===",
+            file=sys.stderr,
+        )
+
+    result = scan_domain(
+        target.domain,
+        **_scan_kwargs(
+            args,
+            target,
+            calibration=calibration,
+            regions=regions,
+            sess=sess,
+            cache=cache,
+            timeout_seconds=timeout_seconds,
+            force_all=force_all,
+            show_progress=show_progress,
+        ),
+    )
+
+    rows = _aggregate_rows(result)
+
+    csv_path: Path | None = None
+    if not args.no_csv and rows:
+        csv_path = (
+            Path(args.csv_path)
+            if (args.csv_path and batch_total is None)
+            else _default_csv_path(target.domain)
+        )
+        _write_csv(csv_path, rows)
+
+    if args.json:
+        _render_json_report(result, rows, csv_path)
+    else:
+        _render_text_report(result, rows, csv_path)
+    return result, csv_path
+
+
+def _print_cache_stats(cache) -> None:
+    if cache is not None and (cache.hits or cache.misses):
+        print(
+            f"[*] Cache: {cache.hits} hit / {cache.misses} miss "
+            f"(saved {cache.hits} fetch{'es' if cache.hits != 1 else ''} "
+            f"on web.archive.org)",
+            file=sys.stderr,
+        )
+
+
+def _run_batch(
+    args,
+    targets,
+    *,
+    sess,
+    cache,
+    calibration,
+    regions,
+    timeout_seconds: float,
+    force_all: bool,
+    show_progress: bool,
+) -> int:
+    """Manifest-driven batch loop: resilient, resumable, per-target isolated.
+
+    Exit codes:
+        0   — every target reached a terminal success state
+        1   — run finished but at least one target failed (rerun to retry)
+        130 — stopped by Ctrl+C; manifest flushed, partial results kept
+    """
+    from kronikier.batch import (
+        BatchManifest,
+        BatchStateError,
+        default_manifest_path,
+    )
+
+    state_path = args.state_file or default_manifest_path(args.targets_file)
+    try:
+        # load() also performs the first atomic flush, so a crash before
+        # the first scan still leaves a complete, inspectable manifest.
+        manifest = BatchManifest.load(
+            state_path,
+            targets,
+            targets_file=args.targets_file,
+            restart=args.restart,
+        )
+    except BatchStateError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(
+            f"error: cannot write batch manifest {state_path}: {e}",
+            file=sys.stderr,
+        )
+        return 2
+
+    total = len(manifest.entries)
+    skipped = sum(1 for e in manifest.entries if e.is_terminal_success())
+    if skipped:
+        print(
+            f"[*] Resuming from {state_path}: {skipped}/{total} target"
+            f"{'s' if skipped != 1 else ''} already finished, "
+            f"{len(manifest.pending())} to run.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[*] Batch manifest: {state_path} ({total} target"
+            f"{'s' if total != 1 else ''})",
+            file=sys.stderr,
+        )
+
+    interrupted = False
+    for idx, entry in enumerate(manifest.entries, start=1):
+        if entry.is_terminal_success():
+            print(
+                f"--- [{idx}/{total}] {entry.domain}: skip "
+                f"(already {entry.state}) ---",
+                file=sys.stderr,
+            )
+            continue
+
+        target = Target(
+            domain=entry.domain,
+            extra_paths=tuple(entry.extra_paths),
+            single_url=entry.single_url,
+        )
+        manifest.mark_running(entry.domain)
+        try:
+            result, csv_path = _process_target(
+                args,
+                target,
+                sess=sess,
+                cache=cache,
+                calibration=calibration,
+                regions=regions,
+                timeout_seconds=timeout_seconds,
+                force_all=force_all,
+                show_progress=show_progress,
+                batch_idx=idx,
+                batch_total=total,
+            )
+        except KeyboardInterrupt:
+            # Ctrl+C between/around scan internals (the scanner normally
+            # catches its own; this covers everything escaping it).
+            manifest.mark_interrupted(entry.domain, None)
+            interrupted = True
+            break
+        except Exception as e:  # noqa: BLE001 — batch must survive any target
+            # One bad target must never take the rest of the batch down.
+            failed = manifest.mark_exception(entry.domain, e)
+            print(
+                f"\n[!] Target {entry.domain} failed "
+                f"({failed.error_category}): {failed.error_message}",
+                file=sys.stderr,
+            )
+            logging.getLogger(__name__).debug(
+                "batch target %s raised",
+                entry.domain,
+                exc_info=True,
+            )
+            continue
+
+        if result.interrupted:
+            # Partial outputs (CSV + report) are already on disk; the entry
+            # goes back to waiting so a rerun retries it.
+            manifest.mark_interrupted(entry.domain, result)
+            print(
+                f"\nInterrupted — {entry.domain} stopped early; rerun the "
+                f"same command to resume from {state_path}.",
+                file=sys.stderr,
+            )
+            interrupted = True
+            break
+
+        # csv_path is the exact artefact _process_target just wrote
+        # (None for zero contacts / --no-csv) — record it verbatim rather
+        # than re-deriving a timestamped name that wouldn't match.
+        manifest.mark_result(entry.domain, result, csv_path=csv_path)
+
+    counts = manifest.counts()
+    print(
+        "\nBatch summary: "
+        f"{counts.get('completed', 0)} completed, "
+        f"{counts.get('no_snapshots', 0)} no snapshots, "
+        f"{counts.get('failed', 0)} failed, "
+        f"{counts.get('waiting', 0)} pending, "
+        f"{counts.get('running', 0)} interrupted"
+        f" — manifest: {state_path}",
+        file=sys.stderr,
+    )
+    _print_cache_stats(cache)
+
+    if interrupted:
+        return 130
+    if counts.get("failed", 0) > 0:
+        return 1
+    return 0
+
+
 def _main_impl(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     # -d / --debug controls log level; -v / --verbose only affects the
@@ -331,6 +682,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
     if args.clear_cache:
         from kronikier.cache import SnapshotCache, default_cache_dir
+
         cache_dir = default_cache_dir()
         cache = SnapshotCache(cache_dir)
         removed = cache.clear()
@@ -388,6 +740,20 @@ def _main_impl(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    if args.restart and not args.targets_file:
+        print(
+            "error: --restart only applies to --targets-file batch runs",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.state_file is not None and not args.targets_file:
+        print(
+            "error: --state-file only applies to --targets-file batch runs",
+            file=sys.stderr,
+        )
+        return 2
+
     if args.csv_path and len(targets) > 1:
         print(
             "error: --csv PATH can't be used with multiple targets — drop it "
@@ -402,15 +768,21 @@ def _main_impl(argv: list[str] | None = None) -> int:
     sess = requests.Session()
     sess.headers["User-Agent"] = DEFAULT_USER_AGENT
     calibration: Calibration | None = ensure_calibration(
-        session=sess, force=args.recalibrate, announce=True,
+        session=sess,
+        force=args.recalibrate,
+        announce=True,
     )
 
     regions = tuple(r.strip() for r in args.regions.split(",") if r.strip())
-    batch = len(targets) > 1
+    # Batch mode is an *input-mode* property: --targets-file is the
+    # unattended batch entry point even when the file holds a single target,
+    # so a one-line targets file still gets manifest tracking and resume.
+    batch = bool(args.targets_file)
 
     cache = None
     if not args.no_cache:
         from kronikier.cache import SnapshotCache, default_cache_dir
+
         cache_dir = default_cache_dir()
         try:
             cache = SnapshotCache(cache_dir)
@@ -432,84 +804,54 @@ def _main_impl(argv: list[str] | None = None) -> int:
             )
             cache = None
 
-    for idx, target in enumerate(targets, start=1):
-        if batch:
-            print(
-                f"\n=== [{idx}/{len(targets)}] {target.domain} "
-                + (
-                    f"(+{len(target.extra_paths)} extra probe path"
-                    f"{'s' if len(target.extra_paths) != 1 else ''})"
-                    if target.extra_paths else ""
-                )
-                + " ===",
-                file=sys.stderr,
-            )
-
-        result = scan_domain(
-            target.domain,
+    if batch:
+        # Manifest-driven batch: per-target isolation, resilient to single
+        # target failures, resumable across Ctrl+C / crashes.
+        return _run_batch(
+            args,
+            targets,
+            sess=sess,
+            cache=cache,
+            calibration=calibration,
+            regions=regions,
             timeout_seconds=timeout_seconds,
             force_all=force_all,
-            no_escalate=args.no_escalate,
-            calibration=calibration,
-            max_snapshots=args.max_snapshots,
-            from_year=args.from_year,
-            to_year=args.to_year,
-            include_subdomains=not args.no_subdomains,
-            probe_well_known=not args.no_probe,
-            min_score=args.min_score,
-            session=sess,
-            max_workers=args.workers,
-            rate_limit_per_sec=args.rate,
-            default_phone_regions=regions,
-            extra_well_known_paths=target.extra_paths,
-            single_url=target.single_url,
-            cache=cache,
-            progress=show_progress,
-            verbose=args.verbose,
-            cdx_timeout=args.cdx_timeout,
+            show_progress=show_progress,
         )
 
-        rows = _aggregate_rows(result)
+    # ----- Single target (positional domain or --single-url) -----
+    target = targets[0]
+    try:
+        result, _csv_path = _process_target(
+            args,
+            target,
+            sess=sess,
+            cache=cache,
+            calibration=calibration,
+            regions=regions,
+            timeout_seconds=timeout_seconds,
+            force_all=force_all,
+            show_progress=show_progress,
+        )
+    except KeyboardInterrupt:
+        # Backstop for interrupts delivered outside the scanner's own
+        # handler (e.g. during calibration teardown).
+        print("\nInterrupted.", file=sys.stderr)
+        _print_cache_stats(cache)
+        return 130
 
-        csv_path: Path | None = None
-        if not args.no_csv and rows:
-            csv_path = (
-                Path(args.csv_path) if (args.csv_path and not batch)
-                else _default_csv_path(target.domain)
-            )
-            _write_csv(csv_path, rows)
-
-        if args.json:
-            _render_json_report(result, rows, csv_path)
-        else:
-            _render_text_report(result, rows, csv_path)
-
-        if result.interrupted:
-            # Partial results are already saved (CSV above + report rendered).
-            # Stop the batch loop — analyst pressed Ctrl+C, don't roll into
-            # the next target.
-            saved = f" saved to {csv_path}" if csv_path else ""
-            print(
-                f"\nInterrupted — {len(rows)} contact(s){saved}.",
-                file=sys.stderr,
-            )
-            if cache is not None and (cache.hits or cache.misses):
-                print(
-                    f"[*] Cache: {cache.hits} hit / {cache.misses} miss "
-                    f"(saved {cache.hits} fetch{'es' if cache.hits != 1 else ''} "
-                    f"on web.archive.org)",
-                    file=sys.stderr,
-                )
-            return 130
-
-    if cache is not None and (cache.hits or cache.misses):
+    if result.interrupted:
+        # Partial results are already saved (CSV + report above).
         print(
-            f"[*] Cache: {cache.hits} hit / {cache.misses} miss "
-            f"(saved {cache.hits} fetch{'es' if cache.hits != 1 else ''} "
-            f"on web.archive.org)",
+            f"\nInterrupted — {len(_aggregate_rows(result))} contact(s)"
+            + (f" saved to {_csv_path}" if _csv_path else "")
+            + ".",
             file=sys.stderr,
         )
+        _print_cache_stats(cache)
+        return 130
 
+    _print_cache_stats(cache)
     return 0
 
 

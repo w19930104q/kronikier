@@ -149,8 +149,10 @@ kronikier --clear-cache                     # wipe the snapshot cache
 | Flag                  | Effect                                                                                                          |
 | --------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `<domain>` (positional) | Default: scan all the contact-bearing pages of a host.                                                        |
-| `--targets-file PATH` | Read a list of targets from PATH — one per line, `#` for comments, blanks ignored. Each entry is a bare domain or a full URL; URL paths extend that domain's well-known probe list. Multiple entries sharing a host are merged. |
+| `--targets-file PATH` | Read a list of targets from PATH — one per line, `#` for comments, blanks ignored. Each entry is a bare domain or a full URL; URL paths extend that domain's well-known probe list. Multiple entries sharing a host are merged. Runs as a **resumable batch** with an atomic manifest (see [Resumable batches](#resumable-batches)). |
 | `--single-url URL`    | Scan only the captures of one exact URL (CDX `matchType=exact`). Probe and contact-URL filter are skipped — we already know what we're looking at. Useful for "how did this one page change?" timeline questions. |
+| `--state-file PATH`   | Location of the resumable batch manifest (default `<targets-file>.manifest.json`, next to the targets file). Only valid with `--targets-file`. |
+| `--restart`           | Ignore any existing batch manifest and rescan every target from scratch. Only valid with `--targets-file`.     |
 
 ### Scope
 | Flag                  | Effect                                                                                          |
@@ -420,6 +422,96 @@ done
 
 `--no-progress` + `--json` gives clean machine-readable output; CSV
 files still land in the working directory.
+
+### Resumable batches
+
+A `--targets-file` run is an unattended batch job, so it is driven by a
+**manifest** that makes it crash-safe and resumable. Nothing about the
+per-target outputs changes — every target still gets its own CSV and its
+own text/JSON report in the exact single-target format.
+
+#### The manifest
+
+By default the manifest is written next to the targets file as
+`<targets-file>.manifest.json` (override with `--state-file PATH`). It is
+rewritten **atomically** (temp file + `rename`, fsynced) after every
+state change, so a crash or power loss at any instant leaves either the
+previous complete document or the next — never a truncated one.
+
+Each target is one row, kept in the targets file's input order, with one
+of these states:
+
+| State          | Meaning                                                                 | Retried on resume? |
+| -------------- | ----------------------------------------------------------------------- | ------------------ |
+| `waiting`      | Parsed but not (yet) finished — including a target interrupted mid-scan | yes                |
+| `running`      | Scan was in progress when the process died                              | yes                |
+| `completed`    | Scan finished and at least one snapshot was fetched                     | no (terminal)      |
+| `no_snapshots` | Scan finished cleanly but the archive had nothing fetchable             | no (terminal)      |
+| `failed`       | The scan raised or the archive backend failed before any fetch          | yes                |
+
+`failed` rows also carry an **error category**:
+
+- `network` — transport/backend failure (`requests` exception, e.g.
+  connection reset, timeout, CDX HTTP 5xx). Usually transient.
+- `unexpected` — any other exception that escaped the scanner.
+
+Alongside the state, each row records attempt count, contact/snapshot
+counters, the CSV path (when one was written), timestamps, and any error
+message.
+
+#### Failure isolation and exit codes
+
+A single target failing **never aborts the batch** — the error is
+recorded, a `[!] Target … failed (category): message` line is printed,
+and the loop moves on to the next domain. The process exit code tells
+the caller how the batch ended:
+
+| Exit code | Meaning                                                          |
+| --------- | ---------------------------------------------------------------- |
+| `0`       | Every target reached a terminal success (`completed`/`no_snapshots`). |
+| `1`       | The run finished but at least one target is still `failed` — rerun to retry it. |
+| `2`       | Usage error (bad arguments, unreadable targets/manifest file).   |
+| `130`     | Stopped by Ctrl+C (128 + SIGINT). The manifest is flushed first. |
+
+#### Resuming
+
+Just rerun the **same command**. Terminal-success targets are skipped
+(an `--- [i/N] domain: skip (already …) ---` line is printed for each),
+and every `waiting` / `running` / `failed` row is retried in input
+order. Finished targets are never rescanned, so no archive bytes are
+spent twice:
+
+```
+$ kronikier --targets-file targets.txt --no-progress
+[*] Resuming from targets.txt.manifest.json: 7/10 targets already finished, 3 to run.
+--- [1/10] a.example: skip (already completed) ---
+…
+Batch summary: 9 completed, 1 no snapshots, 0 failed, 0 pending, 0 interrupted
+ — manifest: targets.txt.manifest.json
+```
+
+If the targets file itself changed, the manifest reconciles on load:
+new domains are inserted at their input position as `waiting`, domains
+removed from the file drop their rows, and a domain whose URL-path hints
+changed resets to `waiting` (the old state described a different scan).
+
+`--restart` discards the on-disk state and scans every target again from
+scratch (the manifest is overwritten). A corrupt or incompatible
+manifest is rejected with a message pointing at `--restart` rather than
+silently dropping history.
+
+#### Ctrl+C behavior
+
+On Ctrl+C the current target's partial contacts are still written to its
+CSV, its manifest row returns to `waiting` (keeping partial counters for
+forensics), the manifest is atomically flushed, and the process exits
+`130`. The next invocation retries that target and continues the rest.
+
+#### Snapshot cache
+
+The shared on-disk snapshot cache is unaffected: its hit/miss summary is
+still printed once at the end of the batch, and cache hits mean resumed
+targets re-fetch nothing the process already downloaded.
 
 ### Restricting to a specific era
 

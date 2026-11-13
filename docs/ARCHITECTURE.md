@@ -106,7 +106,8 @@ see [USAGE.md](USAGE.md).
 | `planner.py`             | Computes a `ScanPlan` from `(timeout, workers, rate, calibration, --all)`. Decides whether to apply the contact-URL filter (drops it when the whole site fits the timeout), what `cdx_limit` to ask for, and what the absolute monotonic deadline is. Preflight uses `show_num_pages` and (for `pages ≤ 2`) `count_captures` to pin the actual capture count, which often flips small sites from "filter on" to "scan everything". |
 | `pipeline.py`            | The orchestrator. Runs the plan via a unified producer-consumer `_scan` with deadline plumbing, threaded CDX iteration with a wall-clock sub-budget, smart probe-skip inference, and zero-result escalation (one shot). Accepts `extra_well_known_paths` to merge per-target probe hints from `--targets-file`, and `single_url` to switch to one-URL-across-time mode. Carries plan metadata into `ScanResult` for the CLI/JSON layer. |
 | `progress_ui.py`         | A thin wrapper around `rich.progress.Progress`. Adds a timeout-countdown column (`Ns left / Ms`), status lines, the live per-contact feed (`-v` adds date + URL beneath), and a daemon heartbeat thread that keeps the countdown ticking even during silent CDX waits. No-op when `enabled=False`. |
-| `cli.py`                 | argparse entrypoint. Resolves named-mode aliases (`--default/--deep/--exhaustive/--auto`) into `(timeout, force_all)`, runs `ensure_calibration`, dispatches the three input modes (positional `<domain>`, `--targets-file`, `--single-url`) to a list of `Target(domain, extra_paths, single_url)` entries, and calls `scan_domain` per target. Catches `KeyboardInterrupt` so partial CSVs save before exit (exit code 130). Renders text + CSV + JSON. |
+| `cli.py`                 | argparse entrypoint. Resolves named-mode aliases (`--default/--deep/--exhaustive/--auto`) into `(timeout, force_all)`, runs `ensure_calibration`, dispatches the three input modes (positional `<domain>`, `--targets-file`, `--single-url`) to a list of `Target(domain, extra_paths, single_url)` entries. Single targets run through `_process_target`; `--targets-file` (even with one target) runs the manifest-driven `_run_batch` loop from `batch.py`. Catches `KeyboardInterrupt` so partial CSVs save before exit (exit code 130). Renders text + CSV + JSON. |
+| `batch.py`               | Resumable batch manifest for unattended `--targets-file` runs. `BatchManifest` holds one ordered `BatchEntry` per target with state (`waiting`/`running`/`completed`/`no_snapshots`/`failed`), error category (`network`/`unexpected`), counters and timestamps. Persists atomically (temp file + fsync + rename) after every transition; classifies `ScanResult` outcomes and escaped exceptions; reconciles with a changed targets file on load and supports `--restart`. The CLI loop isolates per-target failures so one bad domain never blocks the rest. |
 | `report.py`              | Pure rendering layer: `_aggregate_rows` (canonical contact → first/last sighting + distinct raw forms), CSV writer (UTF-8 BOM, `value_raw` column), text/JSON renderers. No I/O on the network side. |
 
 ---
@@ -512,6 +513,57 @@ URLs (`/uslugi/excavator`, `/o-nas/team`) without editing the bundled
 `--csv PATH` is rejected in batch mode to prevent file clobbering; each
 scan uses the default `<domain>_<timestamp>.csv` naming.
 
+### 16. Resumable batch manifest
+
+`--targets-file` is the unattended entry point, so its loop must survive
+both a single misbehaving domain and an externally stopped process.
+`batch.py` adds a manifest (`<targets-file>.manifest.json` by default,
+`--state-file` to override) without changing any per-target output
+format.
+
+State machine per target, in input order:
+
+```
+waiting ──mark_running──▶ running ──mark_result──▶ completed | no_snapshots
+   ▲                          │
+   │                          ├──mark_exception──▶ failed (network | unexpected)
+   └──mark_interrupted────────┘    (failed/running stay retryable)
+```
+
+Key properties:
+
+- **Terminal vs retryable.** Only `completed` (≥1 snapshot fetched) and
+  `no_snapshots` (clean scan, nothing fetchable) are terminal. `failed`,
+  a stale `running` left by a dead process, and an interrupt-reset
+  `waiting` are all retried on the next run. A CDX backend failure with
+  zero fetched pages classifies as `failed/network`; the same error with
+  pages already fetched still classifies as `completed`, because partial
+  success is real success.
+- **Atomic durability.** Every transition flushes the whole document via
+  temp-file + `fsync` + `os.replace`, so a crash can only leave a
+  complete older or newer document, never a torn write. `load()` itself
+  flushes once, guaranteeing a manifest exists even if the process dies
+  before the first scan.
+- **Failure isolation.** The CLI wraps each target in its own
+  try/except: an escaped exception is classified (`requests.*` →
+  `network`, everything else → `unexpected`), recorded, and the loop
+  continues. Per-target aggregation happens inside `_process_target`, so
+  contacts can never bleed across targets and no target is scanned twice
+  in one process.
+- **Input reconciliation.** On load the manifest is rebuilt in the
+  targets file's current order: new domains become `waiting`, removed
+  domains drop their rows, and a domain whose probe-path hints changed
+  resets (its old state described a different scan). A corrupt or
+  wrong-version document is rejected with a `--restart` hint rather than
+  silently discarded.
+- **Exit-code contract.** `0` all terminal, `1` run finished with
+  failures still pending, `130` Ctrl+C (manifest flushed, partial CSVs
+  kept), `2` usage/manifest error — letting an orchestrator distinguish
+  "done" from "retry later" from "stopped".
+- **Cache compatibility.** The snapshot cache and its hit/miss summary
+  are untouched; on resume, cache hits make retried targets re-fetch
+  nothing already downloaded.
+
 ---
 
 ## Outputs
@@ -560,7 +612,12 @@ Empty results never produce a CSV file or a blank table — the CLI prints
 - Ctrl+C anywhere inside the fetch loop is caught at the `_scan`
   boundary: partial sightings are preserved on the returned
   `ScanResult` (`interrupted=True`), the CLI writes the CSV before
-  exit, and `main()` returns exit code 130.
+  exit, and `main()` returns exit code 130. In a `--targets-file` batch
+  the manifest row for the interrupted target resets to `waiting` and is
+  atomically flushed, so rerunning the command resumes the batch there.
+- A batch target that raises is contained by `_run_batch`: the exception
+  is classified and recorded in the manifest, then the loop proceeds to
+  the next target — one bad domain never aborts the remaining batch.
 - The IA User-Agent (`kronikier/0.1 (+https://github.com/soxoj/kronikier)`)
   is sent on every request for transparency.
 - No data is sent anywhere except web.archive.org / archive.org.
@@ -569,7 +626,7 @@ Empty results never produce a CSV file or a blank table — the CLI prints
 
 ## Test taxonomy
 
-- **Unit tests** (`tests/unit/`, ~240, run in <10 s, offline via
+- **Unit tests** (`tests/unit/`, 300+, run in <30 s, offline via
   `responses` and `monkeypatch`):
   - `test_planner.py` — capacity formula, filter-on/off branches,
     user-override ceiling, unlimited timeout, precise-count preflight.
@@ -591,6 +648,16 @@ Empty results never produce a CSV file or a blank table — the CLI prints
     `--calibrate` / `--single-url` / `--no-cache` exit paths,
     Ctrl+C partial-CSV save, `-v` vs `-d` independence,
     timeout-aware hint rendering.
+  - `test_batch.py` — manifest state machine: every transition and error
+    category, resume/skip rules, stale-`running` recovery, input
+    reconciliation, `--restart`, atomic-flush and corrupt-document
+    handling.
+  - `test_batch_cli.py` — end-to-end CLI batches against a fully local
+    archive mock (CDX/availability/playback served from the committed
+    HTML fixtures via `responses`): mixed success + zero-hit + exception
+    in one batch, failure isolation, Ctrl+C + resume without duplicate
+    fetches, exit codes 0/1/130, per-target JSON isolation, manifest
+    location and flag validation.
 - **End-to-end tests** (`tests/e2e/test_live_archive.py`, marked
   `pytest -m e2e`, ~5 min, hits the real wayback). Covers
   `theranos.com` and `enron.com` — both defunct in real life,

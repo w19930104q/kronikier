@@ -39,6 +39,18 @@ kronikier wirecard.com --exhaustive
 kronikier --targets-file targets.txt
 ```
 
+Batch runs are **resumable**: progress is tracked in an atomic manifest
+(`targets.txt.manifest.json` next to the targets file) recording each
+target as `waiting`, `running`, `completed`, `no_snapshots`, or `failed`
+(with a `network` / `unexpected` error category). One target failing
+never stops the others; Ctrl+C or a crash flushes the manifest and the
+next run skips finished targets and continues. Exit code `0` = whole
+batch done, `1` = some targets failed (rerun to retry), `130` =
+interrupted. See
+[Resumable batches](docs/USAGE.md#resumable-batches) for the full
+reference.
+
+
 The first ever invocation runs a one-time latency calibration (~3-5 s,
 cached for 14 days). Every run writes a CSV next to the current
 directory and prints a summary table to the terminal:
